@@ -21,11 +21,12 @@ pub const VERSION_TOKEN: &str = "__C2MD_VERSION__";
 const POLL: Duration = Duration::from_millis(200);
 const KEEPALIVE: Duration = Duration::from_secs(15);
 
-/// The liveness probe, kept as a constant so tests exercise byte-for-byte what the hook sends.
-const PING_REQUEST: &[u8] = b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-
-/// The shutdown request, used by `c2md stop`.
-const QUIT_REQUEST: &[u8] = b"GET /quit HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+/// Builds a request for one of the server's own routes, as the hook and `c2md stop` send them.
+///
+/// The authority is spelled out rather than left as a bare `localhost`, because the server now checks it. Every caller of these routes is this program talking to its own background process, so naming the address it actually bound is both true and the cheapest thing for it to verify.
+fn request(path: &str, port: u16) -> String {
+    format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+}
 
 /// Details of a running server, as recorded in `server.json` for later hook runs to find.
 pub struct Handle {
@@ -35,6 +36,8 @@ pub struct Handle {
 /// Shared between the accept loop and every connection thread.
 struct State {
     dir: PathBuf,
+    /// The port actually bound, which is what an incoming `Host` has to name.
+    port: u16,
     /// Bumped for a session each time the hook reports a new answer.
     versions: Mutex<HashMap<String, u64>>,
     /// Event streams currently attached, counted per session. The total keeps the idle reaper from killing a page someone is reading, and the per-session number is how the hook tells an open tab from one the user closed.
@@ -77,7 +80,7 @@ pub fn ping(port: u16) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
-    if stream.write_all(PING_REQUEST).is_err() {
+    if stream.write_all(request("/ping", port).as_bytes()).is_err() {
         return false;
     }
     status_is_ok(&mut stream)
@@ -90,8 +93,7 @@ pub fn notify(port: u16, session: &str) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
-    let request = format!("GET /notify/{session} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
+    if stream.write_all(request(&format!("/notify/{session}"), port).as_bytes()).is_err() {
         return false;
     }
     status_is_ok(&mut stream)
@@ -104,8 +106,7 @@ pub fn watchers(port: u16, session: &str) -> Option<usize> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
-    let request = format!("GET /watchers/{session} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).ok()?;
+    stream.write_all(request(&format!("/watchers/{session}"), port).as_bytes()).ok()?;
 
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
@@ -140,7 +141,7 @@ pub fn stop(dir: &Path) -> Option<u16> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
-    stream.write_all(QUIT_REQUEST).ok()?;
+    stream.write_all(request("/quit", handle.port).as_bytes()).ok()?;
     status_is_ok(&mut stream).then_some(handle.port)
 }
 
@@ -160,6 +161,7 @@ pub fn serve(dir: PathBuf, port: u16, idle_timeout: Duration) -> std::io::Result
 
     let state = Arc::new(State {
         dir: dir.clone(),
+        port: bound,
         versions: Mutex::new(HashMap::new()),
         watchers: Mutex::new(HashMap::new()),
         last_activity: AtomicU64::new(0),
@@ -204,18 +206,35 @@ fn handle(mut stream: TcpStream, state: &Arc<State>) -> std::io::Result<()> {
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
 
-    // Headers are read and discarded; nothing this server does depends on them.
+    // Only the two headers that say where the request came from are kept; nothing else here depends on any of them.
+    let mut host = String::new();
+    let mut origin = String::new();
     let mut header = String::new();
     loop {
         header.clear();
         if reader.read_line(&mut header)? == 0 || header == "\r\n" || header == "\n" {
             break;
         }
+        if let Some((name, value)) = header.split_once(':') {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "host" => host = value.trim().to_string(),
+                "origin" => origin = value.trim().to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    if !addressed_as_loopback(&host, &origin, state.port) {
+        return respond(&mut stream, "403 Forbidden", "text/plain", b"forbidden");
     }
 
     let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
     let path = path.split('?').next().unwrap_or("/");
 
+    if path == "/" {
+        let html = crate::render::index(&sessions(&state.dir));
+        return respond(&mut stream, "200 OK", "text/html; charset=utf-8", html.as_bytes());
+    }
     if path == "/ping" {
         return respond(&mut stream, "200 OK", "text/plain", b"ok");
     }
@@ -250,7 +269,8 @@ fn handle(mut stream: TcpStream, state: &Arc<State>) -> std::io::Result<()> {
     };
     match std::fs::read_to_string(state.dir.join(format!("{session}.html"))) {
         Ok(html) => {
-            let stamped = html.replace(VERSION_TOKEN, &state.version(&session).to_string());
+            // One occurrence only. The page puts its placeholder in the head, ahead of the answer, so the first match is always the real one even when the answer itself quotes the token.
+            let stamped = html.replacen(VERSION_TOKEN, &state.version(&session).to_string(), 1);
             respond(&mut stream, "200 OK", "text/html; charset=utf-8", stamped.as_bytes())
         }
         Err(_) => respond(&mut stream, "404 Not Found", "text/plain", b"no page for that session yet"),
@@ -343,6 +363,73 @@ fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]
     out.extend_from_slice(body);
     stream.write_all(&out)?;
     stream.flush()
+}
+
+/// Whether a request really came from something addressing this server as loopback.
+///
+/// Binding to 127.0.0.1 sounds like it settles this and does not. A page anywhere on the web can point a hostname it controls at 127.0.0.1, wait for the browser to re-resolve, and then make same-origin requests to whatever is listening here — DNS rebinding. Those requests arrive over the loopback interface like any other, so the address they came from proves nothing; what gives them away is the `Host`, which still carries the attacker's hostname. Checking it costs one string compare and closes the hole.
+///
+/// `Origin` is checked from the other side, for cross-origin requests a browser labels honestly. Neither header is required — a bare HTTP/1.0 client sends no `Host`, and the hook's own requests carry no `Origin` — but a value that is present and foreign is refused.
+fn addressed_as_loopback(host: &str, origin: &str, port: u16) -> bool {
+    if !host.is_empty() && !is_loopback_authority(host, port) {
+        return false;
+    }
+    if !origin.is_empty() {
+        // Anything that is not plain http on this port is by definition not this server.
+        let Some(authority) = origin.strip_prefix("http://") else { return false };
+        if !is_loopback_authority(authority, port) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether an authority names a loopback host on the port this server bound.
+fn is_loopback_authority(authority: &str, port: u16) -> bool {
+    // A colon only separates a port when what follows it is digits, which keeps a bracketed IPv6 literal intact.
+    let (name, given) = match authority.rsplit_once(':') {
+        Some((name, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (name, Some(p)),
+        _ => (authority, None),
+    };
+
+    // An authority with no port means 80, which this server only ever bound if it was asked to.
+    let named_port = match given {
+        Some(p) => p.parse::<u16>().ok(),
+        None => Some(80),
+    };
+    if named_port != Some(port) {
+        return false;
+    }
+
+    let name = name.strip_prefix('[').and_then(|n| n.strip_suffix(']')).unwrap_or(name);
+    matches!(name, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// The rendered pages sitting in the output directory, newest first, as the index lists them.
+fn sessions(dir: &Path) -> Vec<crate::render::IndexEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<crate::render::IndexEntry> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension()? != "html" {
+                return None;
+            }
+            // A stem the routes would refuse is a page the index must not link to.
+            let session = safe_session(path.file_stem()?.to_str()?)?;
+            let meta = e.metadata().ok()?;
+            let epoch_ms = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some(crate::render::IndexEntry { session, epoch_ms, bytes: meta.len() })
+        })
+        .collect();
+    out.sort_by_key(|e| std::cmp::Reverse(e.epoch_ms));
+    out
 }
 
 /// Accepts a session name only if it is already filename-safe, which is what keeps a request from walking out of the output directory.

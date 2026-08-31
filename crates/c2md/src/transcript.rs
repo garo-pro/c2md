@@ -32,9 +32,11 @@ pub struct Answer {
 }
 
 impl Answer {
-    /// Total length of the visible prose, which is what `min_chars` is compared against.
+    /// Total length of the visible prose in characters, which is what `min_chars` is compared against.
+    ///
+    /// Counted in characters rather than bytes because the setting is named for characters, and a short answer in a non-Latin script would otherwise clear a threshold the same answer in English would not.
     pub fn visible_len(&self) -> usize {
-        self.segments.iter().filter(|s| !s.thinking).map(|s| s.body.len()).sum()
+        self.segments.iter().filter(|s| !s.thinking).map(|s| s.body.chars().count()).sum()
     }
 }
 

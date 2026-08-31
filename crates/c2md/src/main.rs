@@ -30,6 +30,7 @@ fn main() {
         "uninstall" => report(uninstall_cmd(&args[1..])),
         "init" => report(init_cmd()),
         "config" => report(config_cmd()),
+        "status" => report(status_cmd()),
         "render" => report(render_cmd(&args[1..])),
         "open" => report(open_cmd()),
         "bench" => report(bench_cmd(&args[1..])),
@@ -62,6 +63,7 @@ USAGE
                                  Remove the Stop hook again
   c2md init                      Write a config file with every setting at its default
   c2md config                    Print the resolved settings and where they came from
+  c2md status                    Report whether the hook is registered and the server is running
   c2md render <file.md> [-o out.html] [--open]
                                  Render a markdown file, for previewing the page style
   c2md open                      Re-open the most recently rendered page
@@ -129,18 +131,14 @@ fn run_hook() {
     // Liveness has to be settled before rendering, because it decides whether the page carries a reload timer.
     let port = if cfg.live_reload { ensure_server(&cfg, &dir) } else { None };
 
-    let t_render = Instant::now();
     let meta = render::PageMeta { cwd, epoch_ms: epoch_ms(), live: port.is_some() };
-    let mut html = render::page(&answer, &cfg, &meta);
-    let render_us = t_render.elapsed().as_micros();
-
-    // The footer advertises the render cost, which is only known once the render is done.
-    html = html.replace(render::RENDER_MICROS, &render_us.to_string());
+    let page = render::page(&answer, &cfg, &meta);
+    let render_us = page.render_us;
 
     let path = output_path(&dir, session, cfg.file_mode);
 
     let t_write = Instant::now();
-    if write_atomic(&path, &html).is_err() {
+    if write_atomic(&path, &page.html).is_err() {
         return;
     }
     let write_us = t_write.elapsed().as_micros();
@@ -423,6 +421,58 @@ fn config_cmd() -> Result<String, String> {
     ))
 }
 
+/// Answers the questions someone asks when nothing opened, in the order they would ask them.
+///
+/// A Stop hook is invisible by design: it fails silently so it cannot interrupt a session, which means a misconfiguration produces no output anywhere. Everything this prints was previously only discoverable by opening a JSON file by hand and guessing.
+fn status_cmd() -> Result<String, String> {
+    let cfg = Config::load();
+    let dir = cfg.resolved_output_dir();
+    let mut out = String::new();
+
+    let installed = [
+        ("user", install::Target::User),
+        ("project", install::Target::Project),
+        ("local", install::Target::Local),
+    ]
+    .into_iter()
+    .filter_map(|(label, target)| install::installed_command(target).map(|cmd| (label, target, cmd)))
+    .collect::<Vec<_>>();
+
+    if installed.is_empty() {
+        out.push_str("hook:      not registered  (run `c2md install --user`)\n");
+    } else {
+        for (label, target, cmd) in &installed {
+            let path = target.path().map(|p| config::tildify(&p)).unwrap_or_default();
+            out.push_str(&format!("hook:      {label:<8} {cmd}\n           in {path}\n"));
+        }
+    }
+
+    out.push_str(&format!("enabled:   {}\n", if cfg.enabled { "yes" } else { "no  (enabled is false)" }));
+
+    let config_note = match config::config_path() {
+        Some(p) if p.exists() => config::tildify(&p),
+        Some(p) => format!("{} (not present, using defaults)", config::tildify(&p)),
+        None => "unavailable".to_string(),
+    };
+    out.push_str(&format!("config:    {config_note}\n"));
+    out.push_str(&format!("output:    {}\n", config::tildify(&dir)));
+
+    let server = match (cfg.live_reload, server::running(&dir)) {
+        (false, _) => "off  (live_reload is false, pages open as file://)".to_string(),
+        (true, Some(handle)) => format!("running on http://127.0.0.1:{}", handle.port),
+        (true, None) => "not running  (it starts on the next answer)".to_string(),
+    };
+    out.push_str(&format!("server:    {server}\n"));
+
+    let newest = newest_page(&dir);
+    out.push_str(&format!(
+        "page:      {}\n",
+        newest.map(|p| config::tildify(&p)).unwrap_or_else(|| "none rendered yet".to_string())
+    ));
+
+    Ok(out.trim_end().to_string())
+}
+
 fn render_cmd(args: &[String]) -> Result<String, String> {
     let mut input = None;
     let mut output = None;
@@ -447,32 +497,35 @@ fn render_cmd(args: &[String]) -> Result<String, String> {
         bytes_read: 0,
     };
 
-    let t = Instant::now();
     let meta = render::PageMeta { cwd: None, epoch_ms: epoch_ms(), live: false };
-    let html = render::page(&answer, &cfg, &meta).replace(render::RENDER_MICROS, &t.elapsed().as_micros().to_string());
+    let page = render::page(&answer, &cfg, &meta);
 
     let out = output.unwrap_or_else(|| cfg.resolved_output_dir().join("render.html"));
-    write_atomic(&out, &html).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    write_atomic(&out, &page.html).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
 
     if open_after {
         browser::open(&out, &cfg.browser).map_err(|e| e.to_string())?;
     }
-    Ok(format!("{} ({} bytes, {} us)", out.display(), html.len(), t.elapsed().as_micros()))
+    Ok(format!("{} ({} bytes, {} us)", out.display(), page.html.len(), page.render_us))
 }
 
 fn open_cmd() -> Result<String, String> {
     let cfg = Config::load();
     let dir = cfg.resolved_output_dir();
-    let newest = std::fs::read_dir(&dir)
-        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+    let newest = newest_page(&dir).ok_or_else(|| format!("no rendered pages in {}", dir.display()))?;
+
+    browser::open(&newest, &cfg.browser).map_err(|e| e.to_string())?;
+    Ok(format!("opened {}", newest.display()))
+}
+
+/// The most recently written page in the output directory, which is the one `c2md open` means.
+fn newest_page(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().map(|x| x == "html").unwrap_or(false))
         .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
         .map(|e| e.path())
-        .ok_or_else(|| format!("no rendered pages in {}", dir.display()))?;
-
-    browser::open(&newest, &cfg.browser).map_err(|e| e.to_string())?;
-    Ok(format!("opened {}", newest.display()))
 }
 
 /// Times the real pipeline against a real transcript, separating the read, the render and the write.
@@ -503,12 +556,12 @@ fn bench_cmd(args: &[String]) -> Result<String, String> {
 
         let t = Instant::now();
         let meta = render::PageMeta { cwd: None, epoch_ms: epoch_ms(), live: false };
-        let html = render::page(&answer, &cfg, &meta);
+        let page = render::page(&answer, &cfg, &meta);
         render.push(t.elapsed().as_micros());
-        html_len = html.len();
+        html_len = page.html.len();
 
         let t = Instant::now();
-        write_atomic(&out, &html).map_err(|e| e.to_string())?;
+        write_atomic(&out, &page.html).map_err(|e| e.to_string())?;
         write.push(t.elapsed().as_micros());
     }
 
@@ -632,12 +685,10 @@ mod tests {
         assert!(opened_within(&fresh, REOPEN_GRACE), "a just-opened tab is inside the grace period");
         assert!(!opened_within(&old, REOPEN_GRACE), "a tab opened two minutes ago is not");
 
-        let mut off = Config::default();
-        off.reopen_if_closed = false;
+        let off = Config { reopen_if_closed: false, ..Config::default() };
         assert!(!tab_is_gone(&off, &old, Some((1, "sess"))), "the setting switches the whole behaviour off");
 
-        let mut timestamped = Config::default();
-        timestamped.file_mode = FileMode::Timestamped;
+        let timestamped = Config { file_mode: FileMode::Timestamped, ..Config::default() };
         assert!(
             !tab_is_gone(&timestamped, &old, Some((1, "sess"))),
             "timestamped pages are never refreshed in place, so a missing watcher proves nothing"

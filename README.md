@@ -65,7 +65,7 @@ Settings live in `~/.claude/c2md.json`, or wherever `$C2MD_CONFIG` points. Every
 | `browser` | `""` | Command to launch. Empty means the OS default handler. |
 | `theme` | `"auto"` | `auto`, `light` or `dark`. Auto follows the system setting. |
 | `title` | `"Claude Code"` | Page title and header text. |
-| `min_chars` | `1` | Skip answers shorter than this, so a one-word reply does not take over a tab. |
+| `min_chars` | `1` | Skip answers shorter than this many characters, so a one-word reply does not take over a tab. |
 | `live_reload` | `true` | Serve the page over loopback and push updates, so the tab changes only when the answer does. |
 | `port` | `0` | Port for that server. Zero lets the OS pick a free one. |
 | `server_idle_secs` | `1800` | Shut the server down after this long with no page watching and no new answers. |
@@ -96,6 +96,20 @@ Two things keep that from firing when it should not. A tab is given twenty secon
 
 The check is only made when the answer is one a live page would have refreshed into: under `file://`, or with `live_reload` off, nothing can tell an open tab from a closed one, and under `file_mode: timestamped` every turn is a new page that no existing tab was showing anyway. In those cases the tab is assumed to still be open, because a wrong guess costs a tab you did not ask for.
 
+### Everything that has been rendered
+
+`/` lists the pages in the output directory, newest first, and every page footer links to it. This is mostly what makes `file_mode: timestamped` worth turning on: that mode writes a page per turn and accumulates a real history of the session, which nothing could browse when the only URL anyone ever had was the newest page.
+
+## What the page and the server will accept
+
+Two things here handle input that nobody in this project wrote, and both are treated that way.
+
+**The answer is not trusted markup.** Claude routinely quotes material it did not author — a file it was asked to summarise, a page it fetched, a diff, a log — and markdown lets raw HTML through by default. On a `file://` page that is untidy; on a page served from `127.0.0.1`, an origin shared with every other session the server is hosting, a `<script>` that arrived inside an answer would run with access to all of them. So raw HTML in an answer is rendered as text: you see exactly what was in the answer, as characters, and it never becomes an element. Behind that, each page carries a Content-Security-Policy with a per-render nonce. Its own style and script match; highlight.js is allowed by origin, and only when `code_highlight` is on; an inline `onerror=` matches neither and does not run.
+
+**A request from a browser is not proof of who sent it.** Binding to 127.0.0.1 sounds sufficient and is not: any site on the web can point a hostname it controls at 127.0.0.1 and have your browser make same-origin requests to whatever is listening there. Those arrive over loopback like anything else, and what gives them away is the `Host` header, which still carries the attacker's name. The server refuses a request whose `Host` is not this port on a loopback name, and one whose `Origin` is present and belongs to someone else. The routes the hook itself calls name the real authority, so they pass.
+
+Nothing here is a substitute for the fact that the port is reachable by anything already running as you on your machine. It closes the door that a web page can walk through.
+
 ## Commands
 
 ```
@@ -104,6 +118,7 @@ c2md install [--user|--project|--local]
 c2md uninstall [--user|--project|--local]
 c2md init                              write a config file with every setting at its default
 c2md config                            print the resolved settings and where they came from
+c2md status                            report whether the hook is registered and the server is up
 c2md render <file.md> [-o out.html] [--open]
 c2md open                              re-open the most recently rendered page
 c2md stop                              stop the background live-reload server
@@ -111,6 +126,23 @@ c2md bench [transcript.jsonl] [iters]  time the pipeline against a real transcri
 ```
 
 `c2md render bench/sample.md --open` is the quickest way to see a template change, since the sample exercises every element the CSS styles.
+
+### When nothing opens
+
+A Stop hook is invisible by design. It exits successfully whatever happens, because a hook that fails would interrupt the session, which also means a misconfiguration produces no output anywhere. `c2md status` is the way in.
+
+```
+$ c2md status
+hook:      user     ~/.claude/bin/c2md hook
+           in ~/.claude/settings.json
+enabled:   yes
+config:    ~/.claude/c2md.json
+output:    /tmp/c2md
+server:    running on http://127.0.0.1:50558
+page:      /tmp/c2md/0f9c1a44-....html
+```
+
+Each line is a thing that can be wrong on its own: the hook not registered, `enabled` set to false, a config file that is not where you think it is, or a server that never came up.
 
 ## Performance
 
@@ -157,6 +189,8 @@ crates/mdbench   the markdown engine comparison
 bench/           the cross-runtime latency harness and the CSS sample
 ```
 
+`cargo test` covers the transcript scan, the page template, the settings-file surgery and the live-reload server end to end; the server tests spawn the real `c2md serve` binary rather than a stand-in. CI runs the build, `clippy` and the tests on Linux, macOS and Windows, because process detachment and browser launching are written three times over and only one of them compiles on any given machine.
+
 ## Notes
 
 Subagent output is skipped: sidechain entries share the transcript file but are not the answer you were given.
@@ -165,4 +199,10 @@ A turn that ends in tool calls with no prose renders nothing, and the hook exits
 
 The background server is spawned with every inherited handle sealed against inheritance. Windows enables handle inheritance for the whole table when spawning, so without that sweep the server would hold a copy of the pipe Claude Code reads the hook through; because the server outlives the hook, that pipe would never reach end of file and every turn would stall until the hook timeout.
 
-In `timestamped` mode each turn is served under its own filename, so those pages are static snapshots rather than live ones. Live updating only makes sense for `overwrite`, where the session has one page that keeps changing.
+In `timestamped` mode each turn is served under its own filename, so those pages are static snapshots rather than live ones. Live updating only makes sense for `overwrite`, where the session has one page that keeps changing. The index at `/` is how you get back to the snapshots.
+
+`c2md uninstall` matches its own hook by the shape of the command — an executable named `c2md` followed by `hook` — rather than by looking for `c2md` anywhere in the string, so an unrelated hook that merely mentions this tool is left alone.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
