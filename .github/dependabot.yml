@@ -1,0 +1,32 @@
+version: 2
+
+updates:
+  # Rust workspace: crates/c2md and crates/mdbench share the root Cargo.lock.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Comparison harness for the benchmarks; not built by CI.
+  - package-ecosystem: npm
+    directory: /bench/node
+    schedule:
+      interval: monthly
+    groups:
+      bench-node:
+        patterns:
+          - "*"
