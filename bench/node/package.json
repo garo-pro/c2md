@@ -1,0 +1,1 @@
+{"name":"c2md-node-bench","private":true,"type":"module","dependencies":{"markdown-it":"^15.0.1","marked":"^18.0.11"}}

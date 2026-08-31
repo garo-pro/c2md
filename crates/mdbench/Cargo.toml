@@ -1,0 +1,10 @@
+[package]
+name = "mdbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+comrak = { version = "0.44", default-features = false }
+markdown = "1.0"
