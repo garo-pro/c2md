@@ -103,19 +103,26 @@ pub fn notify(port: u16, session: &str) -> bool {
 ///
 /// `None` means the question could not be answered — no server, or one too old to know the route — and the caller must not read that as "nobody is watching".
 pub fn watchers(port: u16, session: &str) -> Option<usize> {
+    // The body is a bare count.
+    get(port, &format!("/watchers/{session}"))?.trim().parse().ok()
+}
+
+/// Sends a request and returns the body of a 200 response.
+///
+/// `None` is every way a question can go unanswered — nothing listening, a refusal, a server too old to know the route — and no caller may read it as an answer.
+fn get(port: u16, path: &str) -> Option<String> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
-    stream.write_all(request(&format!("/watchers/{session}"), port).as_bytes()).ok()?;
+    stream.write_all(request(path, port).as_bytes()).ok()?;
 
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
     if !response.starts_with("HTTP/1.1 200") {
         return None;
     }
-    // The body is a bare count, and the response closes the connection, so everything after the blank line is it.
-    let body = response.split("\r\n\r\n").nth(1)?;
-    body.trim().parse().ok()
+    // Every response here closes the connection, so whatever follows the blank line is the whole body.
+    Some(response.split("\r\n\r\n").nth(1)?.to_string())
 }
 
 /// Reads far enough into a response to judge its status line.
@@ -135,14 +142,46 @@ fn status_is_ok(stream: &mut TcpStream) -> bool {
     seen.starts_with(WANTED)
 }
 
+/// What came of asking a server to stop.
+pub enum StopResult {
+    /// Nothing was running, which is not a failure.
+    NotRunning,
+    /// The server acknowledged and is on its way out.
+    Stopped(u16),
+    /// Pages are still attached, so a conditional stop left the server where it was.
+    Watched { port: u16, pages: usize },
+    /// A server is recorded but did not answer, so nothing can be concluded and nothing was done.
+    Unreachable(u16),
+}
+
 /// Asks a running server to exit, which is also how you release the lock Windows holds on a running executable.
 pub fn stop(dir: &Path) -> Option<u16> {
-    let handle = running(dir)?;
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(250)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
-    stream.write_all(request("/quit", handle.port).as_bytes()).ok()?;
-    status_is_ok(&mut stream).then_some(handle.port)
+    match quit(dir, "/quit") {
+        StopResult::Stopped(port) => Some(port),
+        _ => None,
+    }
+}
+
+/// Asks a running server to exit, but only if no page is attached to it.
+///
+/// The condition is decided by the server rather than here. Asking `/watchers` and then `/quit` would be two round trips with a gap between them, and a tab that attached inside that gap would be killed by a decision taken before it existed.
+pub fn stop_if_unwatched(dir: &Path) -> StopResult {
+    quit(dir, "/quit-if-unwatched")
+}
+
+/// The shared body of both stops: find the server, ask it to go, and read back what it decided.
+fn quit(dir: &Path, route: &str) -> StopResult {
+    let Some(handle) = running(dir) else { return StopResult::NotRunning };
+    let Some(body) = get(handle.port, route) else { return StopResult::Unreachable(handle.port) };
+
+    let body = body.trim();
+    if body == "stopping" {
+        return StopResult::Stopped(handle.port);
+    }
+    match body.strip_prefix("watching ").and_then(|count| count.parse().ok()) {
+        Some(pages) => StopResult::Watched { port: handle.port, pages },
+        None => StopResult::Unreachable(handle.port),
+    }
 }
 
 /// The URL a browser should open for a session.
@@ -239,6 +278,16 @@ fn handle(mut stream: TcpStream, state: &Arc<State>) -> std::io::Result<()> {
         return respond(&mut stream, "200 OK", "text/plain", b"ok");
     }
     if path == "/quit" {
+        respond(&mut stream, "200 OK", "text/plain", b"stopping")?;
+        let _ = std::fs::remove_file(state_path(&state.dir));
+        std::process::exit(0);
+    }
+    // Housekeeping for a session that has ended. One server serves every session, so the decision has to turn on the pages actually open, never on the session doing the asking.
+    if path == "/quit-if-unwatched" {
+        let pages = state.total_watchers();
+        if pages > 0 {
+            return respond(&mut stream, "200 OK", "text/plain", format!("watching {pages}").as_bytes());
+        }
         respond(&mut stream, "200 OK", "text/plain", b"stopping")?;
         let _ = std::fs::remove_file(state_path(&state.dir));
         std::process::exit(0);

@@ -30,16 +30,25 @@ cp target/release/c2md ~/.claude/bin/
 ~/.claude/bin/c2md install --user
 ```
 
-`install` edits the `hooks.Stop` array of the chosen settings file in place, backing the original up to `settings.json.bak` first, and leaves any other hooks alone. `c2md uninstall` takes only the c2md entry back out.
+`install` edits the chosen settings file in place, backing the original up to `settings.json.bak` first, and leaves any other hooks alone. `c2md uninstall` takes only the c2md entries back out.
 
 ### What gets registered
 
-`install` writes the most portable command the binary's location allows, in this order.
+Two hooks, both invoking the same binary.
 
-| Situation | Registered command |
+| Event | Command | Why |
+| --- | --- | --- |
+| `Stop` | `c2md hook` | An answer finished. This is the whole product. |
+| `SessionEnd` | `c2md stop --if-unwatched` | The session is over, so a server nobody is looking at can go now rather than waiting out `server_idle_secs`. |
+
+The `SessionEnd` hook is registered with the matcher `prompt_input_exit|logout|other`, which is every reason that means the session has really ended. `clear` and `resume` are deliberately left out: both leave Claude Code running, usually in front of a page you are still reading.
+
+The path in front of the subcommand is the most portable form the binary's location allows, in this order.
+
+| Situation | Registered as |
 | --- | --- |
-| This exact binary is on your `PATH` | `c2md hook` |
-| `--project` or `--local`, binary inside the project | `${CLAUDE_PROJECT_DIR}/target/release/c2md.exe hook` |
+| This exact binary is on your `PATH` | `c2md` |
+| `--project` or `--local`, binary inside the project | `${CLAUDE_PROJECT_DIR}/target/release/c2md.exe` |
 | Anything else | the absolute path |
 
 `$CLAUDE_PROJECT_DIR` is expanded by Claude Code itself and always points at the project root, so a project-scoped settings file stays valid when the checkout moves and is safe to commit. The braced spelling is used because bare `$CLAUDE_PROJECT_DIR` is read as an undefined variable when the hook runs under PowerShell.
@@ -68,7 +77,7 @@ Settings live in `~/.claude/c2md.json`, or wherever `$C2MD_CONFIG` points. Every
 | `min_chars` | `1` | Skip answers shorter than this many characters, so a one-word reply does not take over a tab. |
 | `live_reload` | `true` | Serve the page over loopback and push updates, so the tab changes only when the answer does. |
 | `port` | `0` | Port for that server. Zero lets the OS pick a free one. |
-| `server_idle_secs` | `1800` | Shut the server down after this long with no page watching and no new answers. |
+| `server_idle_secs` | `1800` | Shut the server down after this long with no page watching and no new answers. The `SessionEnd` hook usually gets there first. |
 | `auto_refresh_secs` | `2` | Reload interval for the `file://` fallback only, used when `live_reload` is off or the server cannot start. `0` disables it. |
 | `code_highlight` | `true` | Load highlight.js from a CDN for fenced code. Turn off to keep the page fully offline. |
 | `log` | `false` | Append a timing line per run to `c2md.log` in the output directory. |
@@ -83,6 +92,16 @@ A `file://` page cannot do better on its own. It has no way to ask whether the f
 So c2md serves the page from a small HTTP server on 127.0.0.1 instead. The page holds an `EventSource` open and the server says nothing at all while nothing happens. When an answer lands the hook tells the server, the server sends one line, and the page fetches itself and replaces only the `main`, `header` and `footer` elements. Scroll position and selection survive untouched, and the timestamp flashes once so a change that arrives while you are reading is still noticeable.
 
 Idle cost is a single open socket and no repaints. The server starts on the first answer of a session, is reused by every later hook run, and exits on its own after `server_idle_secs` with nothing watching it. `c2md stop` ends it immediately.
+
+### Ending with the session
+
+Waiting out `server_idle_secs` is a poor way to notice that the thing which started the server has gone, so the `SessionEnd` hook says so: `c2md stop --if-unwatched`.
+
+The condition is the whole point. One server hosts every session, so an unconditional `c2md stop` on exit would take down the page belonging to a session still running in another terminal. `--if-unwatched` stops the server only when no page anywhere is holding an event stream open — which also means a tab you left open keeps its own server alive, and the idle timer, which never reaps a watched server either, remains what eventually collects it.
+
+The server decides, not the hook. Asking `/watchers` and then `/quit` would be two round trips with a gap between them, and a tab that attached inside that gap would be killed by a decision taken before it existed, so `/quit-if-unwatched` does both at once.
+
+None of this is a substitute for the idle timeout. A closed terminal window, a crash or a `kill` never runs the hook at all, and `server_idle_secs` is what catches those.
 
 If the server cannot start, the page falls back to `file://` with the old reload timer, which is worse but never broken. In that mode it saves and restores scroll position across reloads.
 
@@ -118,10 +137,11 @@ c2md install [--user|--project|--local]
 c2md uninstall [--user|--project|--local]
 c2md init                              write a config file with every setting at its default
 c2md config                            print the resolved settings and where they came from
-c2md status                            report whether the hook is registered and the server is up
+c2md status                            report whether the hooks are registered and the server is up
 c2md render <file.md> [-o out.html] [--open]
 c2md open                              re-open the most recently rendered page
-c2md stop                              stop the background live-reload server
+c2md stop [--if-unwatched]             stop the background live-reload server; --if-unwatched
+                                       spares one that still has a page open
 c2md bench [transcript.jsonl] [iters]  time the pipeline against a real transcript
 ```
 
@@ -133,8 +153,9 @@ A Stop hook is invisible by design. It exits successfully whatever happens, beca
 
 ```
 $ c2md status
-hook:      user     ~/.claude/bin/c2md hook
-           in ~/.claude/settings.json
+hooks:     user     in ~/.claude/settings.json
+           Stop        ~/.claude/bin/c2md hook
+           SessionEnd  ~/.claude/bin/c2md stop --if-unwatched
 enabled:   yes
 config:    ~/.claude/c2md.json
 output:    /tmp/c2md
@@ -142,7 +163,7 @@ server:    running on http://127.0.0.1:50558
 page:      /tmp/c2md/0f9c1a44-....html
 ```
 
-Each line is a thing that can be wrong on its own: the hook not registered, `enabled` set to false, a config file that is not where you think it is, or a server that never came up.
+Each line is a thing that can be wrong on its own: the hooks not registered, `enabled` set to false, a config file that is not where you think it is, or a server that never came up.
 
 ## Performance
 

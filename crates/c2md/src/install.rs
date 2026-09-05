@@ -36,32 +36,65 @@ impl Target {
     }
 }
 
-/// Adds a Stop hook invoking this executable, replacing any c2md entry that is already there.
-pub fn install(target: Target, command: &str) -> Result<String, String> {
+/// One hook c2md registers: which event fires it, which subcommand it runs, and when it should run at all.
+struct Hook {
+    event: &'static str,
+    /// Narrows the hook to some of the event's occasions, matched by Claude Code against the event's own reason. `None` registers it for every occasion.
+    matcher: Option<&'static str>,
+    subcommand: &'static str,
+    status: &'static str,
+}
+
+/// Everything `install` writes and `uninstall` takes back out.
+///
+/// `Stop` is the product: it fires when an answer finishes. `SessionEnd` is housekeeping — it lets a server nobody is looking at go away with the session that started it, instead of waiting out `server_idle_secs`.
+const HOOKS: [Hook; 2] = [
+    Hook { event: "Stop", matcher: None, subcommand: "hook", status: "Opening answer in browser" },
+    Hook {
+        // `clear` and `resume` also end a session, and both leave Claude Code running in front of a page the user may still be reading. Only the reasons that mean the session is over for good are worth acting on.
+        event: "SessionEnd",
+        matcher: Some("prompt_input_exit|logout|other"),
+        subcommand: "stop --if-unwatched",
+        status: "Stopping the c2md server",
+    },
+];
+
+/// Registers every hook in `HOOKS` against this executable, replacing any c2md entry that is already there.
+pub fn install(target: Target, executable: &str) -> Result<String, String> {
     let path = target.path().ok_or("cannot locate the settings file")?;
-    install_at(&path, command)
+    install_at(&path, executable)
 }
 
 /// The body of `install`, against an explicit path so it can be exercised without touching a real settings file.
-fn install_at(path: &Path, command: &str) -> Result<String, String> {
+fn install_at(path: &Path, executable: &str) -> Result<String, String> {
     let mut root = read_settings(path)?;
+    let mut written = Vec::new();
 
-    let entries = stop_entries(&mut root);
-    entries.retain(|e| !is_c2md_entry(e));
-    entries.push(serde_json::json!({
-        "hooks": [{
-            "type": "command",
-            "command": command,
-            "timeout": 10,
-            "statusMessage": "Opening answer in browser"
-        }]
-    }));
+    for hook in &HOOKS {
+        let command = command_for(executable, hook.subcommand);
+        let mut entry = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": command,
+                "timeout": 10,
+                "statusMessage": hook.status
+            }]
+        });
+        if let Some(matcher) = hook.matcher {
+            entry["matcher"] = matcher.into();
+        }
+
+        let entries = event_entries(&mut root, hook.event);
+        entries.retain(|e| !is_c2md_entry(e));
+        entries.push(entry);
+        written.push(format!("  {}: {command}", hook.event));
+    }
 
     write_settings(path, &root)?;
-    Ok(format!("Stop hook installed in {}\n  command: {command}", tildify(path)))
+    Ok(format!("hooks installed in {}\n{}", tildify(path), written.join("\n")))
 }
 
-/// Removes every c2md Stop hook from the settings file, leaving anything else untouched.
+/// Removes every c2md hook from the settings file, leaving anything else untouched.
 pub fn uninstall(target: Target) -> Result<String, String> {
     let path = target.path().ok_or("cannot locate the settings file")?;
     uninstall_at(&path)
@@ -74,18 +107,23 @@ fn uninstall_at(path: &Path) -> Result<String, String> {
     }
     let mut root = read_settings(path)?;
 
-    let entries = stop_entries(&mut root);
-    let before = entries.len();
-    entries.retain(|e| !is_c2md_entry(e));
-    let removed = before - entries.len();
+    let mut removed = 0;
+    for hook in &HOOKS {
+        let entries = event_entries(&mut root, hook.event);
+        let before = entries.len();
+        entries.retain(|e| !is_c2md_entry(e));
+        removed += before - entries.len();
 
-    // An emptied list is noise in a hand-edited file, so drop the key entirely.
-    if entries.is_empty() {
-        if let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-            hooks.remove("Stop");
-            if hooks.is_empty() {
-                root.as_object_mut().map(|o| o.remove("hooks"));
+        // An emptied list is noise in a hand-edited file, so drop the key entirely. `event_entries` may have just created this one, which is what keeps a file we never touched coming out exactly as it went in.
+        if entries.is_empty() {
+            if let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+                hooks.remove(hook.event);
             }
+        }
+    }
+    if let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        if hooks.is_empty() {
+            root.as_object_mut().map(|o| o.remove("hooks"));
         }
     }
 
@@ -93,22 +131,27 @@ fn uninstall_at(path: &Path) -> Result<String, String> {
     Ok(format!("removed {removed} c2md hook(s) from {}", tildify(path)))
 }
 
-/// The c2md command currently registered in a settings file, if there is one.
+/// The c2md commands currently registered in a settings file, one entry per event that has one.
 ///
 /// This is what `c2md status` reads, so the first question anyone asks — "is the hook even installed?" — can be answered without opening a JSON file by hand.
-pub fn installed_command(target: Target) -> Option<String> {
-    installed_command_at(&target.path()?)
+pub fn installed_commands(target: Target) -> Vec<(&'static str, String)> {
+    target.path().map(|path| installed_commands_at(&path)).unwrap_or_default()
 }
 
-/// The body of `installed_command`, against an explicit path so it can be tested alongside install and uninstall.
-fn installed_command_at(path: &Path) -> Option<String> {
-    let root = read_settings(path).ok()?;
-    let entries = root["hooks"]["Stop"].as_array()?;
-    entries
+/// The body of `installed_commands`, against an explicit path so it can be tested alongside install and uninstall.
+fn installed_commands_at(path: &Path) -> Vec<(&'static str, String)> {
+    let Ok(root) = read_settings(path) else { return Vec::new() };
+    HOOKS
         .iter()
-        .filter(|e| is_c2md_entry(e))
-        .find_map(|e| e["hooks"].as_array()?.iter().find_map(|h| h["command"].as_str()))
-        .map(str::to_string)
+        .filter_map(|hook| {
+            let command = root["hooks"][hook.event]
+                .as_array()?
+                .iter()
+                .filter(|e| is_c2md_entry(e))
+                .find_map(|e| e["hooks"].as_array()?.iter().find_map(|h| h["command"].as_str()))?;
+            Some((hook.event, command.to_string()))
+        })
+        .collect()
 }
 
 /// Reads a settings file, treating a missing file as an empty object.
@@ -136,8 +179,8 @@ fn write_settings(path: &Path, root: &serde_json::Value) -> Result<(), String> {
     std::fs::write(path, text + "\n").map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// Borrows the `hooks.Stop` array, creating the intermediate objects if the file has never had hooks.
-fn stop_entries(root: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+/// Borrows one event's array of hook entries, creating the intermediate objects if the file has never had hooks.
+fn event_entries<'a>(root: &'a mut serde_json::Value, event: &str) -> &'a mut Vec<serde_json::Value> {
     let obj = root.as_object_mut().expect("settings root is an object");
     let hooks = obj
         .entry("hooks")
@@ -145,10 +188,10 @@ fn stop_entries(root: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
         .as_object_mut()
         .expect("hooks is an object");
     hooks
-        .entry("Stop")
+        .entry(event)
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
-        .expect("Stop is an array")
+        .expect("a hook event holds an array")
 }
 
 /// Recognises an entry as ours by the shape of its command.
@@ -161,26 +204,29 @@ fn is_c2md_entry(entry: &serde_json::Value) -> bool {
 
 /// Whether a registered command is one `install` wrote.
 ///
-/// A substring test for `c2md` was tempting and wrong: `uninstall` would have quietly deleted somebody's unrelated `c2md-notify` hook, or any command that merely mentioned this tool's output directory. Every command we write is an executable named `c2md` followed by the `hook` subcommand, so that is what gets matched.
+/// A substring test for `c2md` was tempting and wrong: `uninstall` would have quietly deleted somebody's unrelated `c2md-notify` hook, or any command that merely mentioned this tool's output directory. Every command we write is an executable named `c2md` followed by one of the subcommands in `HOOKS`, so that is what gets matched — and a bare `c2md stop` stays somebody else's, because we never write one.
 fn is_c2md_command(command: &str) -> bool {
-    let Some(exe) = command.trim().strip_suffix(" hook") else { return false };
+    let command = command.trim();
+    let Some(exe) = HOOKS.iter().find_map(|hook| command.strip_suffix(&format!(" {}", hook.subcommand))) else {
+        return false;
+    };
     let exe = exe.trim().trim_matches('"');
     let name = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
     name.eq_ignore_ascii_case("c2md") || name.eq_ignore_ascii_case("c2md.exe")
 }
 
-/// The command string to register, in the most portable form the executable's location allows.
+/// How to name this executable in a settings file, in the most portable form its location allows.
 ///
 /// An absolute path breaks the moment the checkout moves or the settings file is shared, so we prefer, in order: the bare name when this exact binary is already on `PATH`, then `${CLAUDE_PROJECT_DIR}` when it lives inside the project being configured, and only then an absolute path.
 ///
 /// A bare relative path is deliberately not used. Claude Code resolves one against the directory `claude` was launched from, not the project root, so it silently breaks whenever the session starts from a subdirectory.
-pub fn hook_command(target: Target) -> String {
+pub fn executable(target: Target) -> String {
     let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
 
-    let Some(exe) = exe else { return "c2md hook".to_string() };
+    let Some(exe) = exe else { return "c2md".to_string() };
 
     if same_file_on_path(&exe) {
-        return "c2md hook".to_string();
+        return "c2md".to_string();
     }
 
     if target != Target::User {
@@ -190,6 +236,11 @@ pub fn hook_command(target: Target) -> String {
     }
 
     quote(&normalize(&exe))
+}
+
+/// Joins an executable to a subcommand to make the string a settings file carries.
+fn command_for(executable: &str, subcommand: &str) -> String {
+    format!("{executable} {subcommand}")
 }
 
 /// Expresses the executable relative to the project root, or `None` when it lives outside the checkout.
@@ -206,11 +257,11 @@ fn normalize(p: &Path) -> String {
 }
 
 /// Quotes only when needed, since an unquoted command reads better in a hand-edited settings file.
-fn quote(command: &str) -> String {
-    if command.contains(' ') {
-        format!("\"{command}\" hook")
+fn quote(executable: &str) -> String {
+    if executable.contains(' ') {
+        format!("\"{executable}\"")
     } else {
-        format!("{command} hook")
+        executable.to_string()
     }
 }
 
@@ -260,7 +311,7 @@ mod tests {
         let path = scratch("populated");
         std::fs::write(&path, EXISTING).unwrap();
 
-        install_at(&path, "c2md hook").unwrap();
+        install_at(&path, "c2md").unwrap();
         let root = read(&path);
 
         assert_eq!(root["model"], "opus", "unrelated keys survive");
@@ -274,18 +325,33 @@ mod tests {
     }
 
     #[test]
+    fn the_session_end_hook_is_registered_beside_the_stop_hook() {
+        let path = scratch("session-end");
+        install_at(&path, "c2md").unwrap();
+
+        let ended = read(&path)["hooks"]["SessionEnd"].as_array().unwrap().clone();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0]["hooks"][0]["command"], "c2md stop --if-unwatched", "it must not stop a server other sessions are using");
+        assert_eq!(
+            ended[0]["matcher"], "prompt_input_exit|logout|other",
+            "clearing or suspending a session leaves Claude Code running, so neither should stop the server"
+        );
+    }
+
+    #[test]
     fn uninstalling_removes_only_our_entry() {
         let path = scratch("uninstall");
         std::fs::write(&path, EXISTING).unwrap();
 
-        install_at(&path, "c2md hook").unwrap();
+        install_at(&path, "c2md").unwrap();
         let message = uninstall_at(&path).unwrap();
-        assert!(message.contains("removed 1"), "one entry, reported: {message}");
+        assert!(message.contains("removed 2"), "one entry per event, reported: {message}");
 
         let root = read(&path);
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1);
         assert_eq!(stop[0]["hooks"][0]["command"], "notify-send done", "the user's own hook is untouched");
+        assert!(root["hooks"].get("SessionEnd").is_none(), "an event that held only our hook goes with it");
         assert_eq!(root["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "audit.sh");
     }
 
@@ -293,19 +359,21 @@ mod tests {
     fn installing_twice_replaces_rather_than_accumulates() {
         let path = scratch("twice");
 
-        install_at(&path, "c2md hook").unwrap();
-        install_at(&path, "/opt/bin/c2md hook").unwrap();
+        install_at(&path, "c2md").unwrap();
+        install_at(&path, "/opt/bin/c2md").unwrap();
 
-        let stop = read(&path)["hooks"]["Stop"].as_array().unwrap().clone();
+        let root = read(&path);
+        let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 1, "a reinstall updates the command in place");
         assert_eq!(stop[0]["hooks"][0]["command"], "/opt/bin/c2md hook");
+        assert_eq!(root["hooks"]["SessionEnd"].as_array().unwrap().len(), 1, "and does the same for every other event");
     }
 
     #[test]
     fn an_emptied_hooks_key_is_dropped_instead_of_left_as_noise() {
         let path = scratch("emptied");
 
-        install_at(&path, "c2md hook").unwrap();
+        install_at(&path, "c2md").unwrap();
         uninstall_at(&path).unwrap();
 
         let root = read(&path);
@@ -317,7 +385,7 @@ mod tests {
         let path = scratch("backup");
         std::fs::write(&path, EXISTING).unwrap();
 
-        install_at(&path, "c2md hook").unwrap();
+        install_at(&path, "c2md").unwrap();
 
         let backup = path.with_extension("json.bak");
         assert!(backup.exists(), "a change to a hand-edited file leaves a copy behind");
@@ -337,18 +405,26 @@ mod tests {
         let path = scratch("broken");
         std::fs::write(&path, "{ not json").unwrap();
 
-        let err = install_at(&path, "c2md hook").unwrap_err();
+        let err = install_at(&path, "c2md").unwrap_err();
         assert!(err.contains("not valid JSON"), "got: {err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json", "the file is left exactly as it was");
     }
 
     #[test]
     fn only_our_own_command_shape_is_recognised() {
-        for ours in ["c2md hook", "c2md.exe hook", "/home/a/.claude/bin/c2md hook", "\"C:/Program Files/c2md.exe\" hook", "${CLAUDE_PROJECT_DIR}/target/release/c2md.exe hook"] {
+        for ours in [
+            "c2md hook",
+            "c2md.exe hook",
+            "/home/a/.claude/bin/c2md hook",
+            "\"C:/Program Files/c2md.exe\" hook",
+            "${CLAUDE_PROJECT_DIR}/target/release/c2md.exe hook",
+            "c2md stop --if-unwatched",
+            "\"C:/Program Files/c2md.exe\" stop --if-unwatched",
+        ] {
             assert!(is_c2md_command(ours), "should be recognised: {ours}");
         }
-        // A substring match would have claimed every one of these.
-        for theirs in ["c2md-notify hook", "my-c2md hook", "c2md stop", "echo c2md hook", "logger --tag c2md hook"] {
+        // A substring match would have claimed every one of these, and a bare `c2md stop` is somebody else's because install never writes one.
+        for theirs in ["c2md-notify hook", "my-c2md hook", "c2md stop", "c2md stop --if-unwatched --now", "echo c2md hook", "logger --tag c2md hook"] {
             assert!(!is_c2md_command(theirs), "should not be claimed: {theirs}");
         }
     }
@@ -356,12 +432,15 @@ mod tests {
     #[test]
     fn status_can_read_back_what_was_registered() {
         let path = scratch("status");
-        assert!(installed_command_at(&path).is_none(), "nothing registered yet");
+        assert!(installed_commands_at(&path).is_empty(), "nothing registered yet");
 
-        install_at(&path, "/opt/bin/c2md hook").unwrap();
-        assert_eq!(installed_command_at(&path).as_deref(), Some("/opt/bin/c2md hook"));
+        install_at(&path, "/opt/bin/c2md").unwrap();
+        assert_eq!(
+            installed_commands_at(&path),
+            vec![("Stop", "/opt/bin/c2md hook".to_string()), ("SessionEnd", "/opt/bin/c2md stop --if-unwatched".to_string())]
+        );
 
         uninstall_at(&path).unwrap();
-        assert!(installed_command_at(&path).is_none(), "and gone again afterwards");
+        assert!(installed_commands_at(&path).is_empty(), "and gone again afterwards");
     }
 }

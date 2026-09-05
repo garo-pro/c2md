@@ -124,12 +124,23 @@ fn watchers_counts_an_attached_page_and_forgets_a_closed_one() {
 
     assert_eq!(body_of(&request(port, "/watchers/watched")), "0", "nothing is watching a page nobody opened");
 
+    let reader = attach(port, "watched");
+    assert_eq!(await_watchers(port, "watched", "1"), "1", "an attached page must be counted");
+
+    // Closing the connection is what a closed tab looks like from here.
+    drop(reader);
+    assert_eq!(await_watchers(port, "watched", "0"), "0", "a closed page must stop being counted, and quickly");
+
+    assert!(request(port, "/watchers/../secret").starts_with("HTTP/1.1 400"), "a session name that is not filename-safe is refused");
+}
+
+/// Opens an event stream and reads far enough into it that the server has certainly counted the watcher.
+fn attach(port: u16, session: &str) -> BufReader<TcpStream> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    write!(stream, "GET /events/watched HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
+    write!(stream, "GET /events/{session} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
 
-    // Read the first event so the stream is fully established before the count is checked.
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -139,13 +150,35 @@ fn watchers_counts_an_attached_page_and_forgets_a_closed_one() {
             break;
         }
     }
-    assert_eq!(await_watchers(port, "watched", "1"), "1", "an attached page must be counted");
+    reader
+}
 
-    // Closing the connection is what a closed tab looks like from here.
+/// The SessionEnd hook, end to end: a session going away must not take a page somebody else is reading with it.
+#[test]
+fn the_conditional_quit_spares_a_watched_server_and_stops_an_unwatched_one() {
+    let server = start();
+    let (dir, port) = (&server.dir, server.port);
+    std::fs::write(dir.join("open.html"), "<html><main>x</main></html>").unwrap();
+
+    let reader = attach(port, "open");
+    assert_eq!(await_watchers(port, "open", "1"), "1", "the page must be attached before the question means anything");
+
+    assert_eq!(body_of(&request(port, "/quit-if-unwatched")), "watching 1", "a page is open, so the server stays");
+    assert!(request(port, "/ping").starts_with("HTTP/1.1 200"), "and it is still serving afterwards");
+
+    // Closing the tab is the only thing that changes the answer.
     drop(reader);
-    assert_eq!(await_watchers(port, "watched", "0"), "0", "a closed page must stop being counted, and quickly");
+    assert_eq!(await_watchers(port, "open", "0"), "0");
 
-    assert!(request(port, "/watchers/../secret").starts_with("HTTP/1.1 400"), "a session name that is not filename-safe is refused");
+    assert_eq!(body_of(&request(port, "/quit-if-unwatched")), "stopping", "with nothing watching, the server goes");
+
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err(), "the port must stop answering");
+    assert!(!dir.join("server.json").exists(), "and the record of it must not outlive it");
 }
 
 #[test]

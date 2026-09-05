@@ -35,7 +35,7 @@ fn main() {
         "open" => report(open_cmd()),
         "bench" => report(bench_cmd(&args[1..])),
         "serve" => report(serve_cmd(&args[1..])),
-        "stop" => report(stop_cmd()),
+        "stop" => report(stop_cmd(&args[1..])),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             0
@@ -58,18 +58,20 @@ c2md - open the last Claude Code answer in your browser
 USAGE
   c2md hook                      Read a Stop hook payload on stdin and render the answer (default)
   c2md install [--user|--project|--local]
-                                 Register the Stop hook in a Claude Code settings file
+                                 Register the Stop and SessionEnd hooks in a settings file
   c2md uninstall [--user|--project|--local]
-                                 Remove the Stop hook again
+                                 Remove both hooks again
   c2md init                      Write a config file with every setting at its default
   c2md config                    Print the resolved settings and where they came from
-  c2md status                    Report whether the hook is registered and the server is running
+  c2md status                    Report whether the hooks are registered and the server is running
   c2md render <file.md> [-o out.html] [--open]
                                  Render a markdown file, for previewing the page style
   c2md open                      Re-open the most recently rendered page
   c2md bench [transcript.jsonl] [iters]
                                  Time the full pipeline end to end
-  c2md stop                      Stop the background live-reload server
+  c2md stop [--if-unwatched]     Stop the background live-reload server. --if-unwatched leaves it
+                                 alone while a page is still open, which is what the SessionEnd hook
+                                 runs so one session ending cannot close another session's page
   c2md serve [--port N] [--dir D] [--idle S]
                                  Run the live-reload server in the foreground; the hook starts its
                                  own in the background, so this is for debugging
@@ -375,7 +377,7 @@ fn epoch_ms() -> u64 {
 
 fn install_cmd(args: &[String]) -> Result<String, String> {
     let target = parse_target(args)?;
-    let msg = install::install(target, &install::hook_command(target))?;
+    let msg = install::install(target, &install::executable(target))?;
     let cfg_note = match config::config_path() {
         Some(p) if !p.exists() => format!("\n\nRun `c2md init` to write a config file at {}.", config::tildify(&p)),
         _ => String::new(),
@@ -435,15 +437,19 @@ fn status_cmd() -> Result<String, String> {
         ("local", install::Target::Local),
     ]
     .into_iter()
-    .filter_map(|(label, target)| install::installed_command(target).map(|cmd| (label, target, cmd)))
+    .map(|(label, target)| (label, target, install::installed_commands(target)))
+    .filter(|(_, _, hooks)| !hooks.is_empty())
     .collect::<Vec<_>>();
 
     if installed.is_empty() {
-        out.push_str("hook:      not registered  (run `c2md install --user`)\n");
+        out.push_str("hooks:     not registered  (run `c2md install --user`)\n");
     } else {
-        for (label, target, cmd) in &installed {
+        for (label, target, hooks) in &installed {
             let path = target.path().map(|p| config::tildify(&p)).unwrap_or_default();
-            out.push_str(&format!("hook:      {label:<8} {cmd}\n           in {path}\n"));
+            out.push_str(&format!("hooks:     {label:<8} in {path}\n"));
+            for (event, cmd) in hooks {
+                out.push_str(&format!("           {event:<11} {cmd}\n"));
+            }
         }
     }
 
@@ -613,12 +619,35 @@ fn serve_cmd(args: &[String]) -> Result<String, String> {
 }
 
 /// Stops the background server, if one is running.
-fn stop_cmd() -> Result<String, String> {
-    let dir = Config::load().resolved_output_dir();
-    match server::stop(&dir) {
-        Some(port) => Ok(format!("stopped the server on port {port}")),
-        None => Ok("no server running".to_string()),
+///
+/// Nothing here is an error. This runs as a SessionEnd hook, where a non-zero exit is reported to the user as a failed hook, and every way this can go wrong — no server, one that has already gone, one still serving somebody — is a perfectly ordinary outcome.
+fn stop_cmd(args: &[String]) -> Result<String, String> {
+    let mut if_unwatched = false;
+    for arg in args {
+        match arg.as_str() {
+            "--if-unwatched" => if_unwatched = true,
+            other => return Err(format!("unknown option `{other}`")),
+        }
     }
+
+    let dir = Config::load().resolved_output_dir();
+    if !if_unwatched {
+        return Ok(match server::stop(&dir) {
+            Some(port) => format!("stopped the server on port {port}"),
+            None => "no server running".to_string(),
+        });
+    }
+
+    Ok(match server::stop_if_unwatched(&dir) {
+        server::StopResult::NotRunning => "no server running".to_string(),
+        server::StopResult::Stopped(port) => format!("stopped the server on port {port}"),
+        server::StopResult::Watched { port, pages } => {
+            format!("left the server on port {port} running, {pages} page(s) still open")
+        }
+        server::StopResult::Unreachable(port) => {
+            format!("left the server on port {port} alone, it did not answer")
+        }
+    })
 }
 
 fn median(v: &[u128]) -> u128 {
