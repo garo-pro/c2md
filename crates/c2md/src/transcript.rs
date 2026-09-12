@@ -1,6 +1,8 @@
 //! Pulls the answer out of a Claude Code session transcript, which is a JSONL file appended to as the turn runs.
 //!
-//! The file grows without bound over a long session, so we never read it whole. We map a window off the end and walk backwards line by line until we hit the human message that started the turn, growing the window only if that boundary is further back than expected.
+//! The file grows without bound over a long session, so we never read it whole. We read a window off the end and walk backwards line by line until the answer is complete, widening the window only if it was not. Widening only ever reads the bytes it adds, so a turn that takes several passes still parses every line exactly once.
+//!
+//! The first turn of a session usually does take several passes. Claude Code writes its prompt snapshots, skill and tool listings and environment blocks into the transcript as attachment records between the human message and the answer, which on a current version is a couple of hundred KiB standing where the 64 KiB window used to reach.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -44,94 +46,114 @@ impl Answer {
 pub fn extract(path: &Path, scope: Scope, include_thinking: bool) -> Option<Answer> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
+
+    let mut acc = Scan::default();
     let mut window = INITIAL_WINDOW;
+    // Start of the oldest whole line already scanned, so a wider window only has to read what it adds.
+    let mut scanned_from = len;
 
     loop {
         let start = len.saturating_sub(window);
-        let text = read_window(&mut file, start, len)?;
-        let (answer, hit_boundary) = scan(&text, scope, include_thinking);
+        let (text, text_start) = read_lines(&mut file, start, scanned_from)?;
+        acc.bytes_read += text.len();
+        let complete = acc.absorb(&text, scope, include_thinking);
+        scanned_from = text_start;
 
-        // A found boundary means the whole turn was inside the window, so the answer is complete.
-        if hit_boundary || start == 0 || window >= MAX_WINDOW {
-            let mut answer = answer?;
-            answer.bytes_read = text.len();
-            return Some(answer);
+        if complete || start == 0 || window >= MAX_WINDOW {
+            return acc.finish();
         }
-        window *= 4;
+        window = (window * 4).min(MAX_WINDOW);
     }
 }
 
-/// Reads `[start, len)` and drops any partial first line, so the caller always gets whole JSONL records.
-fn read_window(file: &mut File, start: u64, len: u64) -> Option<String> {
+/// Reads `[start, end)` and drops any partial first line, returning the text and the offset it begins at.
+///
+/// `end` is always either the end of the file or the start of a line a previous pass already read, so the last line is never cut in half.
+fn read_lines(file: &mut File, start: u64, end: u64) -> Option<(String, u64)> {
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    file.take(len - start).read_to_end(&mut buf).ok()?;
+    let mut buf = Vec::with_capacity((end - start) as usize);
+    file.take(end - start).read_to_end(&mut buf).ok()?;
 
     // Slicing at a newline is always a safe UTF-8 boundary, so this cannot split a multi-byte character.
-    let body = if start > 0 {
-        match buf.iter().position(|&b| b == b'\n') {
-            Some(nl) => &buf[nl + 1..],
-            None => &buf[..],
-        }
-    } else {
-        &buf[..]
+    // A window landing inside one enormous line has no newline to cut at; that line fails to parse and is skipped.
+    let skipped = match (start > 0).then(|| buf.iter().position(|&b| b == b'\n')).flatten() {
+        Some(nl) => nl + 1,
+        None => 0,
     };
-    Some(String::from_utf8_lossy(body).into_owned())
+    Some((String::from_utf8_lossy(&buf[skipped..]).into_owned(), start + skipped as u64))
 }
 
-/// Walks the window backwards, collecting assistant output until the human message that opened the turn.
-///
-/// Returns the answer together with whether the human boundary was actually reached, which tells the caller if a larger window is needed.
-fn scan(text: &str, scope: Scope, include_thinking: bool) -> (Option<Answer>, bool) {
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut prompt = None;
-    let mut model = None;
-    let mut hit_boundary = false;
+/// The answer being assembled as the window walks backwards, holding segments newest first.
+#[derive(Default)]
+struct Scan {
+    segments: Vec<Segment>,
+    prompt: Option<String>,
+    model: Option<String>,
+    bytes_read: usize,
+}
 
-    for line in text.lines().rev() {
-        // Cheap pre-filter: most lines in a busy transcript are tool results and file snapshots we never want.
-        let is_assistant = line.contains("\"type\":\"assistant\"");
-        let is_user = !is_assistant && line.contains("\"type\":\"user\"");
-        if !is_assistant && !is_user {
-            continue;
-        }
-
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-
-        // Subagent transcripts are interleaved into the same file; their output is not this turn's answer.
-        if v["isSidechain"].as_bool() == Some(true) {
-            continue;
-        }
-
-        if is_user {
-            if !is_human_turn(&v) {
+impl Scan {
+    /// Walks one chunk backwards, newest line first, and reports whether the answer is now complete.
+    ///
+    /// Chunks arrive newest first and each is walked backwards, so appending to a newest-first list stays ordered across however many passes it takes.
+    fn absorb(&mut self, text: &str, scope: Scope, include_thinking: bool) -> bool {
+        for line in text.lines().rev() {
+            // Cheap pre-filter: most lines in a busy transcript are attachments, tool results and file snapshots we never want.
+            let is_assistant = line.contains("\"type\":\"assistant\"");
+            let is_user = !is_assistant && line.contains("\"type\":\"user\"");
+            if !is_assistant && !is_user {
                 continue;
             }
-            prompt = user_prompt_text(&v);
-            hit_boundary = true;
-            break;
-        }
 
-        if model.is_none() {
-            model = v["message"]["model"].as_str().map(str::to_string);
-        }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
 
-        let before = segments.len();
-        collect_blocks(&v["message"]["content"], include_thinking, &mut segments);
+            // Subagent transcripts are interleaved into the same file; their output is not this turn's answer.
+            if v["isSidechain"].as_bool() == Some(true) {
+                continue;
+            }
 
-        // In `last` mode a single assistant message is the whole answer, so stop as soon as one yielded prose.
-        if scope == Scope::Last && segments[before..].iter().any(|s| !s.thinking) {
-            break;
+            if is_user {
+                if !is_human_turn(&v) {
+                    continue;
+                }
+                self.prompt = user_prompt_text(&v);
+                // The message that opened the turn: everything the answer could contain is already in hand.
+                return true;
+            }
+
+            if self.model.is_none() {
+                self.model = v["message"]["model"].as_str().map(str::to_string);
+            }
+
+            let before = self.segments.len();
+            collect_blocks(&v["message"]["content"], include_thinking, &mut self.segments);
+
+            // In `last` mode a single assistant message is the whole answer, so one that yielded prose
+            // finishes the job. Reporting that as complete is what keeps the window from growing to the
+            // whole file looking for a boundary this mode never reads.
+            if scope == Scope::Last && self.segments[before..].iter().any(|s| !s.thinking) {
+                return true;
+            }
         }
+        false
     }
 
-    segments.reverse();
-    let answer = if segments.iter().any(|s| !s.body.trim().is_empty()) {
-        Some(Answer { segments, prompt, model, bytes_read: 0 })
-    } else {
-        None
-    };
-    (answer, hit_boundary)
+    /// Puts the segments back in the order they were produced, or reports that the turn held no prose.
+    fn finish(mut self) -> Option<Answer> {
+        self.segments.reverse();
+        if !self.segments.iter().any(|s| !s.body.trim().is_empty()) {
+            return None;
+        }
+        Some(Answer { segments: self.segments, prompt: self.prompt, model: self.model, bytes_read: self.bytes_read })
+    }
+}
+
+/// Scans one self-contained window, for tests that do not want to go through a file.
+#[cfg(test)]
+fn scan(text: &str, scope: Scope, include_thinking: bool) -> (Option<Answer>, bool) {
+    let mut acc = Scan::default();
+    let complete = acc.absorb(text, scope, include_thinking);
+    (acc.finish(), complete)
 }
 
 /// Appends the text (and optionally thinking) blocks of one assistant message, newest first.
@@ -264,8 +286,93 @@ mod tests {
     #[test]
     fn a_missing_boundary_reports_so_the_window_can_grow() {
         let partial = r#"{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"tail only"}]}}"#;
-        let (answer, boundary) = scan(partial, Scope::Turn, false);
-        assert!(!boundary);
+        let (answer, complete) = scan(partial, Scope::Turn, false);
+        assert!(!complete);
         assert!(answer.is_some());
+    }
+
+    /// `last` mode never reads as far back as the human message, so completeness cannot be a report of
+    /// having seen one. Saying otherwise sent the window off to swallow the whole transcript looking for
+    /// a boundary this mode stops short of on purpose.
+    #[test]
+    fn last_scope_is_complete_without_reaching_the_human_message() {
+        let tail = r#"{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"the answer"}]}}"#;
+        let (answer, complete) = scan(tail, Scope::Last, false);
+        assert!(complete);
+        assert_eq!(answer.expect("an answer").segments[0].body, "the answer");
+    }
+
+    /// Writes `body` to a scratch file and returns the path, keeping the name unique per test.
+    fn scratch(name: &str, body: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("c2md-transcript-{}-{name}.jsonl", std::process::id()));
+        std::fs::write(&path, body).expect("write the fixture");
+        path
+    }
+
+    /// One turn padded out past the first window, the shape every session's opening turn now has.
+    fn padded(pad_lines: usize) -> String {
+        let filler = format!(
+            r#"{{"type":"attachment","isSidechain":false,"attachment":{{"type":"prompt_snapshot","systemPrompt":[{{"type":"text","text":"{}"}}]}}}}"#,
+            "x".repeat(4000)
+        );
+        let mut out = String::new();
+        for _ in 0..pad_lines {
+            out.push_str(&filler);
+            out.push('\n');
+        }
+        out.push_str(r#"{"type":"user","isSidechain":false,"origin":{"kind":"human"},"message":{"role":"user","content":"the question"}}"#);
+        out.push('\n');
+        for half in ["first half", "second half"] {
+            out.push_str(&format!(
+                r#"{{"type":"assistant","isSidechain":false,"message":{{"model":"claude-opus-5","content":[{{"type":"text","text":"{half}"}}]}}}}"#
+            ));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// A boundary past the first window is reached by widening, and the answer comes back whole and in order.
+    #[test]
+    fn a_turn_wider_than_the_first_window_is_still_assembled_in_order() {
+        let path = scratch("wide", &padded(40));
+        let answer = extract(&path, Scope::Turn, false).expect("an answer");
+        let bodies: Vec<&str> = answer.segments.iter().map(|s| s.body.as_str()).collect();
+        assert_eq!(bodies, vec!["first half", "second half"]);
+        assert_eq!(answer.prompt.as_deref(), Some("the question"));
+        assert_eq!(answer.model.as_deref(), Some("claude-opus-5"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Widening reads only what it adds, so the passes together cost about one read of the turn rather
+    /// than one of every window tried.
+    #[test]
+    fn widening_reads_each_byte_once() {
+        let body = padded(40);
+        let path = scratch("once", &body);
+        let answer = extract(&path, Scope::Turn, false).expect("an answer");
+        assert!(
+            answer.bytes_read <= body.len(),
+            "read {} bytes of a {} byte transcript",
+            answer.bytes_read,
+            body.len()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The whole point of the `last` fix: the answer sits in the first window, so nothing behind it is read.
+    #[test]
+    fn last_scope_does_not_read_past_the_answer() {
+        let body = padded(400);
+        let path = scratch("last", &body);
+        let answer = extract(&path, Scope::Last, false).expect("an answer");
+        assert_eq!(answer.segments.len(), 1);
+        assert_eq!(answer.segments[0].body, "second half");
+        assert!(
+            answer.bytes_read <= INITIAL_WINDOW as usize,
+            "read {} bytes of a {} byte transcript to find an answer in the last window",
+            answer.bytes_read,
+            body.len()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -198,9 +198,11 @@ About 2 ms of the c2md figure is live reload: one loopback round trip to check t
 
 ### Inside the process
 
-`c2md bench` breaks the pipeline down. On a 1 MB transcript with a typical answer, extraction reads a 64 KiB tail in about 180 us and rendering takes about 25 us; the rest is the file write, which is dominated by the OS and on Windows by whatever the antivirus does to a newly created file.
+`c2md bench` breaks the pipeline down. Rendering takes about 25 us; the rest is extraction and the file write, the latter dominated by the OS and on Windows by whatever the antivirus does to a newly created file.
 
-The transcript is never read whole. c2md reads a 64 KiB window off the end and grows it fourfold only if the human message that opened the turn is further back than that, so cost stays flat as a session grows.
+The transcript is never read whole. c2md reads a 64 KiB window off the end, walks it backwards, and widens fourfold only when the turn did not fit. Widening re-reads nothing: each pass takes only the bytes it adds, so however many passes a turn needs, every line is read and parsed exactly once and the cost is one pass over the turn rather than one over the whole file.
+
+That matters more than it used to. Claude Code writes its prompt snapshots, skill and tool listings and environment blocks into the transcript as `attachment` records, and on a current version those run to a couple of hundred KiB per session — sitting between the human message and the answer, and again after it. The 64 KiB window no longer reaches the answer of the turn that just ended, let alone the message that opened it, so the opening turn of a session now widens two or three times as a matter of course. A larger first window is not the fix: measured against real transcripts it overshoots the common case, reading a quarter of a megabyte where 54 KiB would have done, and the widening it saves is two `seek` calls.
 
 ## Layout
 
@@ -215,6 +217,8 @@ bench/           the cross-runtime latency harness and the CSS sample
 ## Notes
 
 Subagent output is skipped: sidechain entries share the transcript file but are not the answer you were given.
+
+`scope: "last"` stops at the newest assistant message rather than walking back to the prompt, so those pages have no subtitle: the message that opened the turn is never read, and reading back to it purely to caption the page would cost the whole saving the mode exists for.
 
 A turn that ends in tool calls with no prose renders nothing, and the hook exits quietly. The same is true of an empty or unreadable transcript — a Stop hook that fails would interrupt the session, so every error path here exits successfully and silently.
 
