@@ -181,14 +181,27 @@ fn collect_blocks(content: &serde_json::Value, include_thinking: bool, out: &mut
     }
 }
 
-/// Distinguishes a real human turn from the tool-result records that Claude Code also stores with `type: "user"`.
+/// Local slash commands (`/copy`, `/exit`, ...) are echoed into the transcript as their own
+/// `type: "user"` records — a caveat, the command name, its stdout — each carrying plain string
+/// content just like a real prompt does. Only the first of the three is marked `isMeta`, so the
+/// other two are indistinguishable from a real human message by shape alone; these prefixes are
+/// the stable wrapper Claude Code puts around all three. Without filtering them out, a scan
+/// landing on one stops short of the real turn boundary and reports the turn as empty.
+const SYNTHETIC_COMMAND_ECHO_PREFIXES: [&str; 3] =
+    ["<local-command-caveat>", "<command-name>", "<local-command-stdout>"];
+
+/// Distinguishes a real human turn from the tool-result and slash-command-echo records that Claude
+/// Code also stores with `type: "user"`.
 fn is_human_turn(v: &serde_json::Value) -> bool {
+    if v["isMeta"].as_bool() == Some(true) {
+        return false;
+    }
     if v["origin"]["kind"].as_str() == Some("human") {
         return true;
     }
     let content = &v["message"]["content"];
-    if content.is_string() {
-        return true;
+    if let Some(s) = content.as_str() {
+        return !SYNTHETIC_COMMAND_ECHO_PREFIXES.iter().any(|p| s.starts_with(p));
     }
     match content.as_array() {
         Some(blocks) => !blocks.iter().any(|b| b["type"].as_str() == Some("tool_result")),
@@ -272,6 +285,40 @@ mod tests {
         let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"x"}]}}"#;
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
         assert!(!is_human_turn(&v));
+    }
+
+    /// A local slash command (`/copy`, `/exit`, ...) echoes a caveat, the command name and its stdout
+    /// into the transcript as separate `type: "user"` records with plain string content — the same
+    /// shape a real human message has. Only the caveat carries `isMeta: true`; the other two do not,
+    /// so both signals are needed. Trusting shape alone stops the scan short of the real boundary.
+    #[test]
+    fn slash_command_echoes_are_not_mistaken_for_the_human_turn() {
+        let caveat = r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat...</local-command-caveat>"}}"#;
+        let command_name = r#"{"type":"user","message":{"role":"user","content":"<command-name>/copy</command-name>\n<command-message>copy</command-message>\n<command-args></command-args>"}}"#;
+        let stdout = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Catch you later!</local-command-stdout>"}}"#;
+        for line in [caveat, command_name, stdout] {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(!is_human_turn(&v), "should not treat `{line}` as the human turn boundary");
+        }
+    }
+
+    /// The end-to-end failure this caused: trailing slash-command echoes after the answer made a
+    /// scan starting from the true end of the file stop immediately, before collecting anything.
+    #[test]
+    fn a_trailing_slash_command_does_not_swallow_the_answer_before_it() {
+        let transcript = [
+            r#"{"type":"user","isSidechain":false,"origin":{"kind":"human"},"message":{"role":"user","content":"7COPY"}}"#,
+            r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-opus-5","content":[{"type":"text","text":"the answer"}]}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>...</local-command-caveat>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/copy</command-name>"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Copied.</local-command-stdout>"}}"#,
+        ]
+        .join("\n");
+        let (answer, boundary) = scan(&transcript, Scope::Turn, false);
+        assert!(boundary);
+        let answer = answer.expect("an answer, not swallowed by the trailing /copy echo");
+        assert_eq!(answer.segments[0].body, "the answer");
+        assert_eq!(answer.prompt.as_deref(), Some("7COPY"));
     }
 
     #[test]
