@@ -119,7 +119,8 @@ fn run_hook() {
     let cwd = payload["cwd"].as_str();
 
     let t_extract = Instant::now();
-    let Some(answer) = transcript::extract(Path::new(transcript_path), cfg.scope, cfg.include_thinking) else {
+    let settle = Duration::from_millis(cfg.settle_ms);
+    let Some(answer) = transcript::extract(Path::new(transcript_path), cfg.scope, cfg.include_thinking, settle) else {
         return;
     };
     let extract_us = t_extract.elapsed().as_micros();
@@ -555,7 +556,8 @@ fn bench_cmd(args: &[String]) -> Result<String, String> {
 
     for _ in 0..iters {
         let t = Instant::now();
-        let answer = transcript::extract(&path, cfg.scope, cfg.include_thinking)
+        // A transcript on disk is finished, so the settle wait has nothing to wait for and costs nothing.
+        let answer = transcript::extract(&path, cfg.scope, cfg.include_thinking, Duration::ZERO)
             .ok_or("no assistant answer found in that transcript")?;
         extract.push(t.elapsed().as_micros());
         bytes_read = answer.bytes_read;

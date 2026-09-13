@@ -53,6 +53,10 @@ pub struct Config {
     pub title: String,
     /// Answers shorter than this are not worth a browser tab, so they are skipped.
     pub min_chars: usize,
+    /// How long the hook will wait, in milliseconds, for Claude Code to finish writing the turn's last message before rendering what it can see.
+    ///
+    /// The hook is started off the same event as that write, so it regularly gets there first. Nothing waits when the answer is already on disk, which is the ordinary case; this only bounds how long a turn that ends without any prose at all can stall the hook.
+    pub settle_ms: u64,
     /// Serve the page from a loopback server that pushes updates, so the tab changes only when the answer actually does.
     pub live_reload: bool,
     /// Port for that server. Zero lets the OS pick a free one, which is what you want unless a firewall rule needs a fixed number.
@@ -84,6 +88,7 @@ impl Default for Config {
             theme: Theme::Auto,
             title: "Claude Code".to_string(),
             min_chars: 1,
+            settle_ms: 2000,
             live_reload: true,
             port: 0,
             server_idle_secs: 1800,
@@ -129,6 +134,7 @@ impl Config {
         if let Some(s) = v["browser"].as_str() { self.browser = s.to_string(); }
         if let Some(s) = v["title"].as_str() { self.title = s.to_string(); }
         if let Some(n) = v["min_chars"].as_u64() { self.min_chars = n as usize; }
+        if let Some(n) = v["settle_ms"].as_u64() { self.settle_ms = n; }
         if let Some(n) = v["auto_refresh_secs"].as_u64() { self.auto_refresh_secs = n as u32; }
     }
 
@@ -151,6 +157,7 @@ impl Config {
         if let Ok(s) = std::env::var("C2MD_BROWSER") { self.browser = s; }
         if let Ok(s) = std::env::var("C2MD_TITLE") { self.title = s; }
         if let Ok(s) = std::env::var("C2MD_MIN_CHARS") { if let Ok(n) = s.parse() { self.min_chars = n; } }
+        if let Ok(s) = std::env::var("C2MD_SETTLE_MS") { if let Ok(n) = s.parse() { self.settle_ms = n; } }
         if let Ok(s) = std::env::var("C2MD_AUTO_REFRESH_SECS") { if let Ok(n) = s.parse() { self.auto_refresh_secs = n; } }
     }
 
@@ -180,6 +187,7 @@ impl Config {
             "theme": match self.theme { Theme::Auto => "auto", Theme::Light => "light", Theme::Dark => "dark" },
             "title": self.title,
             "min_chars": self.min_chars,
+            "settle_ms": self.settle_ms,
             "live_reload": self.live_reload,
             "port": self.port,
             "server_idle_secs": self.server_idle_secs,

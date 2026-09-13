@@ -7,6 +7,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::config::Scope;
 
@@ -15,6 +16,9 @@ const INITIAL_WINDOW: u64 = 64 * 1024;
 
 /// Ceiling on window growth, so a pathological transcript cannot make the hook read hundreds of megabytes.
 const MAX_WINDOW: u64 = 32 * 1024 * 1024;
+
+/// How often the tail is re-read while waiting for the turn's last message to land.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// One contiguous run of assistant output, tagged by whether it was visible prose or reasoning.
 pub struct Segment {
@@ -43,7 +47,39 @@ impl Answer {
 }
 
 /// Reads the transcript tail and returns the assistant output for the current turn, or `None` if there is none.
-pub fn extract(path: &Path, scope: Scope, include_thinking: bool) -> Option<Answer> {
+///
+/// A Stop hook can outrun the transcript. Claude Code stamps a message with the time it was produced but appends it to the JSONL a moment later, and the hook is launched off the same end-of-turn event as that write, so a scan starting immediately can land on a file whose newest record is still the second-to-last one. That is why the answer would go missing while the tool calls that preceded it rendered perfectly: everything except the final message was already on disk.
+///
+/// So the read is retried for up to `settle` until the tail proves the turn is over. Nothing waits in the ordinary case, where the answer is already there on the first read.
+pub fn extract(path: &Path, scope: Scope, include_thinking: bool, settle: Duration) -> Option<Answer> {
+    let deadline = Instant::now() + settle;
+    let mut bytes_read = 0;
+    loop {
+        let (answer, ended) = read_turn(path, scope, include_thinking);
+        // Every attempt costs a read, and `c2md bench` is the one caller that wants to know about all of them.
+        bytes_read += answer.as_ref().map(|a| a.bytes_read).unwrap_or(0);
+
+        if ended || Instant::now() >= deadline {
+            return answer.map(|a| Answer { bytes_read, ..a });
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// One pass over the tail, returning the answer so far and whether the turn's last message has landed.
+fn read_turn(path: &Path, scope: Scope, include_thinking: bool) -> (Option<Answer>, bool) {
+    match scan_tail(path, scope, include_thinking) {
+        Some(acc) => {
+            let ended = acc.turn_ended();
+            (acc.finish(), ended)
+        }
+        // A transcript that cannot be read will not become readable by being read again.
+        None => (None, true),
+    }
+}
+
+/// Walks the tail backwards, widening the window until the turn boundary is in hand.
+fn scan_tail(path: &Path, scope: Scope, include_thinking: bool) -> Option<Scan> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
 
@@ -60,7 +96,7 @@ pub fn extract(path: &Path, scope: Scope, include_thinking: bool) -> Option<Answ
         scanned_from = text_start;
 
         if complete || start == 0 || window >= MAX_WINDOW {
-            return acc.finish();
+            return Some(acc);
         }
         window = (window * 4).min(MAX_WINDOW);
     }
@@ -83,6 +119,14 @@ fn read_lines(file: &mut File, start: u64, end: u64) -> Option<(String, u64)> {
     Some((String::from_utf8_lossy(&buf[skipped..]).into_owned(), start + skipped as u64))
 }
 
+/// What the newest assistant record in the file says about whether the turn is over.
+struct Tail {
+    /// `stop_reason` of that record: `tool_use` on every message that hands off to a tool, something else once the model has stopped talking.
+    stop_reason: Option<String>,
+    /// Whether it carried prose, which is what proves the record holding the answer itself has been written.
+    has_text: bool,
+}
+
 /// The answer being assembled as the window walks backwards, holding segments newest first.
 #[derive(Default)]
 struct Scan {
@@ -90,6 +134,8 @@ struct Scan {
     prompt: Option<String>,
     model: Option<String>,
     bytes_read: usize,
+    /// Set from the first assistant record the backwards walk meets, which is the newest one in the file.
+    tail: Option<Tail>,
 }
 
 impl Scan {
@@ -127,15 +173,32 @@ impl Scan {
 
             let before = self.segments.len();
             collect_blocks(&v["message"]["content"], include_thinking, &mut self.segments);
+            let produced_text = self.segments[before..].iter().any(|s| !s.thinking);
+
+            if self.tail.is_none() {
+                self.tail = Some(Tail {
+                    stop_reason: v["message"]["stop_reason"].as_str().map(str::to_string),
+                    has_text: produced_text,
+                });
+            }
 
             // In `last` mode a single assistant message is the whole answer, so one that yielded prose
             // finishes the job. Reporting that as complete is what keeps the window from growing to the
             // whole file looking for a boundary this mode never reads.
-            if scope == Scope::Last && self.segments[before..].iter().any(|s| !s.thinking) {
+            if scope == Scope::Last && produced_text {
                 return true;
             }
         }
         false
+    }
+
+    /// Whether the newest assistant record in the file is the one that finished the turn.
+    ///
+    /// Two things have to hold, because Claude Code splits a single message across records. `stop_reason` rules out a message that is only handing off to a tool, and the text block rules out having caught the message's thinking record while the prose record behind it is still unwritten.
+    ///
+    /// An empty tail means no assistant record was found at all, which is the reading a Stop hook gets when it beats the whole message to disk.
+    fn turn_ended(&self) -> bool {
+        self.tail.as_ref().is_some_and(|t| t.has_text && t.stop_reason.as_deref() != Some("tool_use"))
     }
 
     /// Puts the segments back in the order they were produced, or reports that the turn held no prose.
@@ -154,6 +217,14 @@ fn scan(text: &str, scope: Scope, include_thinking: bool) -> (Option<Answer>, bo
     let mut acc = Scan::default();
     let complete = acc.absorb(text, scope, include_thinking);
     (acc.finish(), complete)
+}
+
+/// Whether a self-contained window reads as a finished turn, which is what the settle wait is watching for.
+#[cfg(test)]
+fn scan_turn_ended(text: &str) -> bool {
+    let mut acc = Scan::default();
+    acc.absorb(text, Scope::Turn, false);
+    acc.turn_ended()
 }
 
 /// Appends the text (and optionally thinking) blocks of one assistant message, newest first.
@@ -382,7 +453,7 @@ mod tests {
     #[test]
     fn a_turn_wider_than_the_first_window_is_still_assembled_in_order() {
         let path = scratch("wide", &padded(40));
-        let answer = extract(&path, Scope::Turn, false).expect("an answer");
+        let answer = extract(&path, Scope::Turn, false, Duration::ZERO).expect("an answer");
         let bodies: Vec<&str> = answer.segments.iter().map(|s| s.body.as_str()).collect();
         assert_eq!(bodies, vec!["first half", "second half"]);
         assert_eq!(answer.prompt.as_deref(), Some("the question"));
@@ -396,7 +467,7 @@ mod tests {
     fn widening_reads_each_byte_once() {
         let body = padded(40);
         let path = scratch("once", &body);
-        let answer = extract(&path, Scope::Turn, false).expect("an answer");
+        let answer = extract(&path, Scope::Turn, false, Duration::ZERO).expect("an answer");
         assert!(
             answer.bytes_read <= body.len(),
             "read {} bytes of a {} byte transcript",
@@ -406,12 +477,88 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// One assistant record in the shape Claude Code writes it, where `stop_reason` is what separates a
+    /// message handing off to a tool from the one that ended the turn.
+    fn assistant(text: &str, stop_reason: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","isSidechain":false,"message":{{"model":"claude-opus-5","stop_reason":"{stop_reason}","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    /// A transcript caught mid-turn: the model has spoken once and gone off to a tool, and the answer is still to come.
+    fn mid_turn() -> String {
+        [
+            r#"{"type":"user","isSidechain":false,"origin":{"kind":"human"},"message":{"role":"user","content":"the question"}}"#.to_string(),
+            assistant("looking into it", "tool_use"),
+            r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","content":"output"}]}}"#.to_string(),
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    /// `stop_reason` is the signal that the model has stopped talking, and a tool hand-off is not that.
+    #[test]
+    fn a_tail_that_is_still_calling_tools_is_not_a_finished_turn() {
+        assert!(!scan_turn_ended(&mid_turn()), "a message that handed off to a tool has more to come");
+        assert!(
+            scan_turn_ended(&(mid_turn() + &assistant("the answer", "end_turn"))),
+            "an end_turn message carrying prose is the end of the turn"
+        );
+    }
+
+    /// Claude Code writes one message's thinking and its prose as two records, so an `end_turn` record
+    /// with no text is the first half of an answer whose second half has not been written yet.
+    #[test]
+    fn an_end_turn_record_without_prose_is_only_half_an_answer() {
+        let thinking = r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"nearly there"}]}}"#;
+        assert!(!scan_turn_ended(&(mid_turn() + thinking + "\n")));
+        assert!(scan_turn_ended(&(mid_turn() + thinking + "\n" + &assistant("the answer", "end_turn"))));
+    }
+
+    /// The bug this whole mechanism exists for. A Stop hook is launched off the same event as the write of
+    /// the turn's last message and regularly beats it to disk, which is why the answer went missing while
+    /// the messages before it rendered perfectly. Waiting for the tail to say the turn is over fixes it.
+    #[test]
+    fn an_answer_still_being_written_is_waited_for_rather_than_missed() {
+        let path = scratch("late", &mid_turn());
+
+        let appending = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&appending).expect("append the answer");
+            f.write_all(assistant("the real answer", "end_turn").as_bytes()).expect("append the answer");
+        });
+
+        let answer = extract(&path, Scope::Turn, false, Duration::from_secs(5)).expect("an answer");
+        writer.join().expect("the writer thread");
+
+        let bodies: Vec<&str> = answer.segments.iter().map(|s| s.body.as_str()).collect();
+        assert_eq!(bodies, vec!["looking into it", "the real answer"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A turn can end without ever producing prose — an interrupted one, say — and the wait has to be a
+    /// bound rather than a promise, since a Stop hook that never returns is worse than a missing page.
+    #[test]
+    fn a_turn_that_never_finishes_gives_up_when_the_budget_runs_out() {
+        let path = scratch("budget", &mid_turn());
+        let started = Instant::now();
+        let answer = extract(&path, Scope::Turn, false, Duration::from_millis(150));
+        let waited = started.elapsed();
+
+        assert_eq!(answer.expect("what prose there is").segments.len(), 1);
+        assert!(waited >= Duration::from_millis(150), "it gave up after {waited:?}, before the budget");
+        assert!(waited < Duration::from_secs(2), "it waited {waited:?}, far past the budget");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The whole point of the `last` fix: the answer sits in the first window, so nothing behind it is read.
     #[test]
     fn last_scope_does_not_read_past_the_answer() {
         let body = padded(400);
         let path = scratch("last", &body);
-        let answer = extract(&path, Scope::Last, false).expect("an answer");
+        let answer = extract(&path, Scope::Last, false, Duration::ZERO).expect("an answer");
         assert_eq!(answer.segments.len(), 1);
         assert_eq!(answer.segments[0].body, "second half");
         assert!(
