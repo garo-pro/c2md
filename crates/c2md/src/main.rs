@@ -501,6 +501,7 @@ fn render_cmd(args: &[String]) -> Result<String, String> {
         segments: vec![transcript::Segment { thinking: false, body: md }],
         prompt: None,
         model: None,
+        session_title: None,
         bytes_read: 0,
     };
 

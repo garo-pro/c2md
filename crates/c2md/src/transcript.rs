@@ -20,6 +20,11 @@ const MAX_WINDOW: u64 = 32 * 1024 * 1024;
 /// How often the tail is re-read while waiting for the turn's last message to land.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// How far behind the scanned turn to look for the session's name when the turn itself did not carry one.
+///
+/// Claude Code re-appends the name after every turn so it stays near the end of the file, so this is rarely read at all, and when it is, only lines that name a title are parsed.
+const TITLE_WINDOW: u64 = 512 * 1024;
+
 /// One contiguous run of assistant output, tagged by whether it was visible prose or reasoning.
 pub struct Segment {
     pub thinking: bool,
@@ -33,6 +38,8 @@ pub struct Answer {
     pub prompt: Option<String>,
     /// Model id reported by the last assistant message, shown in the page footer.
     pub model: Option<String>,
+    /// The session's name as Claude Code shows it: the `/rename` title if there is one, otherwise the generated one.
+    pub session_title: Option<String>,
     /// Bytes actually read off the end of the transcript, reported by `c2md bench`.
     pub bytes_read: usize,
 }
@@ -96,6 +103,18 @@ fn scan_tail(path: &Path, scope: Scope, include_thinking: bool) -> Option<Scan> 
         scanned_from = text_start;
 
         if complete || start == 0 || window >= MAX_WINDOW {
+            if acc.title().is_none() && text_start > 0 {
+                let from = text_start.saturating_sub(TITLE_WINDOW);
+                if let Some((more, _)) = read_lines(&mut file, from, text_start) {
+                    acc.bytes_read += more.len();
+                    for line in more.lines().rev() {
+                        acc.absorb_title(line);
+                        if acc.custom_title.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
             return Some(acc);
         }
         window = (window * 4).min(MAX_WINDOW);
@@ -133,6 +152,10 @@ struct Scan {
     segments: Vec<Segment>,
     prompt: Option<String>,
     model: Option<String>,
+    /// Newest `/rename` title seen, which always wins over a generated one.
+    custom_title: Option<String>,
+    /// Newest generated title seen.
+    ai_title: Option<String>,
     bytes_read: usize,
     /// Set from the first assistant record the backwards walk meets, which is the newest one in the file.
     tail: Option<Tail>,
@@ -144,6 +167,9 @@ impl Scan {
     /// Chunks arrive newest first and each is walked backwards, so appending to a newest-first list stays ordered across however many passes it takes.
     fn absorb(&mut self, text: &str, scope: Scope, include_thinking: bool) -> bool {
         for line in text.lines().rev() {
+            if self.absorb_title(line) {
+                continue;
+            }
             // Cheap pre-filter: most lines in a busy transcript are attachments, tool results and file snapshots we never want.
             let is_assistant = line.contains("\"type\":\"assistant\"");
             let is_user = !is_assistant && line.contains("\"type\":\"user\"");
@@ -192,6 +218,32 @@ impl Scan {
         false
     }
 
+    /// Records the session name if `line` carries one, keeping the newest of each kind, and reports whether it was a title line.
+    fn absorb_title(&mut self, line: &str) -> bool {
+        let (kind, key) = if line.contains("\"type\":\"custom-title\"") {
+            ("custom-title", "customTitle")
+        } else if line.contains("\"type\":\"ai-title\"") {
+            ("ai-title", "aiTitle")
+        } else {
+            return false;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return false };
+        if v["type"].as_str() != Some(kind) {
+            return false;
+        }
+        let Some(title) = v[key].as_str().map(str::trim).filter(|t| !t.is_empty()) else { return true };
+        let slot = if kind == "custom-title" { &mut self.custom_title } else { &mut self.ai_title };
+        if slot.is_none() {
+            *slot = Some(title.to_string());
+        }
+        true
+    }
+
+    /// The name the page should carry: a `/rename` title wins over a generated one.
+    fn title(&self) -> Option<&String> {
+        self.custom_title.as_ref().or(self.ai_title.as_ref())
+    }
+
     /// Whether the newest assistant record in the file is the one that finished the turn.
     ///
     /// Two things have to hold, because Claude Code splits a single message across records. `stop_reason` rules out a message that is only handing off to a tool, and the text block rules out having caught the message's thinking record while the prose record behind it is still unwritten.
@@ -207,7 +259,8 @@ impl Scan {
         if !self.segments.iter().any(|s| !s.body.trim().is_empty()) {
             return None;
         }
-        Some(Answer { segments: self.segments, prompt: self.prompt, model: self.model, bytes_read: self.bytes_read })
+        let session_title = self.custom_title.or(self.ai_title);
+        Some(Answer { segments: self.segments, prompt: self.prompt, model: self.model, session_title, bytes_read: self.bytes_read })
     }
 }
 
@@ -553,10 +606,29 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A newer name beats an older one, `/rename` beats the generated name, and a name behind the turn boundary is still found.
+    #[test]
+    fn the_session_name_is_picked_up_with_a_rename_winning() {
+        let ai = |t: &str| format!(r#"{{"type":"ai-title","aiTitle":"{t}","sessionId":"s"}}"#);
+        let custom = |t: &str| format!(r#"{{"type":"custom-title","customTitle":"{t}","sessionId":"s"}}"#);
+
+        let (answer, _) = scan(&(fixture() + "\n" + &ai("old name") + "\n" + &ai("new name")), Scope::Turn, false);
+        assert_eq!(answer.expect("an answer").session_title.as_deref(), Some("new name"));
+
+        let (answer, _) = scan(&(fixture() + "\n" + &custom("renamed") + "\n" + &ai("generated")), Scope::Turn, false);
+        assert_eq!(answer.expect("an answer").session_title.as_deref(), Some("renamed"));
+
+        let path = scratch("title", &(custom("renamed") + "\n" + &ai("generated") + "\n" + &padded(40)));
+        let answer = extract(&path, Scope::Turn, false, Duration::ZERO).expect("an answer");
+        assert_eq!(answer.session_title.as_deref(), Some("renamed"));
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The whole point of the `last` fix: the answer sits in the first window, so nothing behind it is read.
     #[test]
     fn last_scope_does_not_read_past_the_answer() {
-        let body = padded(400);
+        // Claude Code re-appends the session name every turn, so a real tail carries one and the title fallback never reads further back.
+        let body = padded(400) + r#"{"type":"ai-title","aiTitle":"name","sessionId":"s"}"# + "\n";
         let path = scratch("last", &body);
         let answer = extract(&path, Scope::Last, false, Duration::ZERO).expect("an answer");
         assert_eq!(answer.segments.len(), 1);

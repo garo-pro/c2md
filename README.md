@@ -73,7 +73,8 @@ Settings live in `~/.claude/c2md.json`, or wherever `$C2MD_CONFIG` points. Every
 | `file_mode` | `"overwrite"` | `overwrite` keeps one page per session; `timestamped` writes a new file per turn, building a history. |
 | `browser` | `""` | Command to launch. Empty means the OS default handler. |
 | `theme` | `"auto"` | `auto`, `light` or `dark`. Auto follows the system setting. |
-| `title` | `"Claude Code"` | Page title and header text. |
+| `title` | `"Claude Code"` | Page title and header text when the session has no name yet, or `session_title` is off. |
+| `session_title` | `true` | Use the session's name as the page title and header: the `/rename` title if you set one, otherwise the one Claude Code generates. |
 | `min_chars` | `1` | Skip answers shorter than this many characters, so a one-word reply does not take over a tab. |
 | `settle_ms` | `2000` | How long to wait for Claude Code to finish writing the turn's last message before rendering. The hook is started off the same event as that write and regularly beats it to disk, which is what used to make the final answer go missing. Nothing waits when the answer is already there; this only bounds a turn that ends without any prose at all. |
 | `live_reload` | `true` | Serve the page over loopback and push updates, so the tab changes only when the answer does. |

@@ -49,8 +49,10 @@ pub struct Config {
     /// Browser command to spawn. Empty means whatever the OS has registered for the file.
     pub browser: String,
     pub theme: Theme,
-    /// Text shown in the page title and header.
+    /// Text shown in the page title and header when the session has no name yet, or `session_title` is off.
     pub title: String,
+    /// Use the session's name (`/rename`, or the one Claude Code generates) as the page title and header.
+    pub session_title: bool,
     /// Answers shorter than this are not worth a browser tab, so they are skipped.
     pub min_chars: usize,
     /// How long the hook will wait, in milliseconds, for Claude Code to finish writing the turn's last message before rendering what it can see.
@@ -87,6 +89,7 @@ impl Default for Config {
             browser: String::new(),
             theme: Theme::Auto,
             title: "Claude Code".to_string(),
+            session_title: true,
             min_chars: 1,
             settle_ms: 2000,
             live_reload: true,
@@ -133,6 +136,7 @@ impl Config {
         if let Some(s) = v["output_dir"].as_str() { if !s.is_empty() { self.output_dir = PathBuf::from(s); } }
         if let Some(s) = v["browser"].as_str() { self.browser = s.to_string(); }
         if let Some(s) = v["title"].as_str() { self.title = s.to_string(); }
+        if let Some(b) = v["session_title"].as_bool() { self.session_title = b; }
         if let Some(n) = v["min_chars"].as_u64() { self.min_chars = n as usize; }
         if let Some(n) = v["settle_ms"].as_u64() { self.settle_ms = n; }
         if let Some(n) = v["auto_refresh_secs"].as_u64() { self.auto_refresh_secs = n as u32; }
@@ -156,6 +160,7 @@ impl Config {
         if let Ok(s) = std::env::var("C2MD_OUTPUT_DIR") { if !s.is_empty() { self.output_dir = PathBuf::from(s); } }
         if let Ok(s) = std::env::var("C2MD_BROWSER") { self.browser = s; }
         if let Ok(s) = std::env::var("C2MD_TITLE") { self.title = s; }
+        if let Some(b) = env_bool("C2MD_SESSION_TITLE") { self.session_title = b; }
         if let Ok(s) = std::env::var("C2MD_MIN_CHARS") { if let Ok(n) = s.parse() { self.min_chars = n; } }
         if let Ok(s) = std::env::var("C2MD_SETTLE_MS") { if let Ok(n) = s.parse() { self.settle_ms = n; } }
         if let Ok(s) = std::env::var("C2MD_AUTO_REFRESH_SECS") { if let Ok(n) = s.parse() { self.auto_refresh_secs = n; } }
@@ -186,6 +191,7 @@ impl Config {
             "browser": self.browser,
             "theme": match self.theme { Theme::Auto => "auto", Theme::Light => "light", Theme::Dark => "dark" },
             "title": self.title,
+            "session_title": self.session_title,
             "min_chars": self.min_chars,
             "settle_ms": self.settle_ms,
             "live_reload": self.live_reload,
