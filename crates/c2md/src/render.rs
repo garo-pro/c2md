@@ -219,6 +219,7 @@ footer {{ margin-top:3rem; padding-top:.75rem; border-top:1px solid var(--rule);
       document.querySelector("main").replaceWith(next);
       if (header) document.querySelector("header").replaceWith(header);
       if (footer) document.querySelector("footer").replaceWith(footer);
+      if (doc.title) document.title = doc.title;
       stamp(document);
       if (window.hljs) hljs.highlightAll();
 
@@ -251,7 +252,7 @@ footer {{ margin-top:3rem; padding-top:.75rem; border-top:1px solid var(--rule);
 </body>
 </html>
 "#,
-        title = escape(&cfg.title),
+        title = escape(page_title(answer, cfg)),
         epoch_ms = meta.epoch_ms,
         csp = csp(cfg, &nonce),
         nonce = nonce,
@@ -265,6 +266,14 @@ footer {{ margin-top:3rem; padding-top:.75rem; border-top:1px solid var(--rule);
     );
 
     Page { html, render_us }
+}
+
+/// The session's own name when there is one and `session_title` allows it, otherwise the configured title.
+fn page_title<'a>(answer: &'a Answer, cfg: &'a Config) -> &'a str {
+    match &answer.session_title {
+        Some(t) if cfg.session_title => t,
+        _ => &cfg.title,
+    }
 }
 
 /// One rendered page, as the index lists it.
@@ -418,6 +427,7 @@ mod tests {
             segments: vec![Segment { thinking: false, body: md.to_string() }],
             prompt: None,
             model: None,
+            session_title: None,
             bytes_read: 0,
         }
     }
